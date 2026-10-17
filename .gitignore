@@ -1,0 +1,6 @@
+# local secrets
+extras/paperless-ocr/paperless-gpt.env
+*.env
+!*.env.example
+.DS_Store
+__pycache__/

@@ -1,0 +1,39 @@
+# Kaito (workspace chart) on bring-your-own nodes (k3s, no cloud provisioning).
+# Tested: Kaito chart 0.12.0 on k3s v1.35.4, RTX 3090 node, Oct 2026.
+#
+#   helm repo add kaito https://kaito-project.github.io/kaito/charts/kaito
+#   helm install kaito-workspace kaito/workspace --version 0.12.0 \
+#     -n kaito-workspace --create-namespace -f kaito-values.yaml
+#
+# Four chart defaults break a BYO cluster (see ../docs/pitfalls.md):
+
+clusterName: homelab
+
+# 1. Without nodeProvisioner=byo the webhook rejects every Workspace with
+#    "instanceType is required when node auto-provisioning is enabled", even with the feature gate below.
+#    `byo` is only documented as a controller flag in cmd/workspace/main.go.
+nodeProvisioner: byo
+
+featureGates:
+  disableNodeAutoProvisioning: true
+  gatewayAPIInferenceExtension: true   # InferenceSet -> InferencePool + llm-d router (EPP) via Flux
+
+# 2. Kaito's own NVIDIA device plugin would fight HAMi's.
+nvidiaDevicePlugin:
+  enabled: false
+
+# 3. Kaito's bundled NFD + GFD run next to the GPU Operator's: the second NFD master WIPED the
+#    nvidia.com/gpu.* labels that Kaito itself needs, and its GFD crash-looped ("unsupported strategy auto").
+gpu-feature-discovery:
+  nfd:
+    enabled: false
+  gfd:
+    enabled: false
+
+# 4. Azure local-disk CSI driver, not needed outside AKS.
+localCSIDriver:
+  useLocalCSIDriver: false
+
+# Keep the controller on the (CPU-only) control plane.
+nodeSelector:
+  node-role.kubernetes.io/control-plane: "true"   # k3s server nodes carry this label

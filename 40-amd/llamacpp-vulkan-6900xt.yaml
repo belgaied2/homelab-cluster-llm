@@ -1,0 +1,45 @@
+# RX 6900 XT (16 GB, RDNA2): not supported by HAMi, Kaito or vLLM, so it runs a plain Deployment
+# with llama.cpp on Vulkan (RADV). Whole GPU via the ROCm device plugin (amd.com/gpu).
+# Exposed as NodePort 30084. Model files cached on the node's disk (/var/lib/models).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amd-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chat-14b, namespace: amd-demo, labels: { app: chat-14b } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # one GPU, no room for a second pod during updates
+  selector: { matchLabels: { app: chat-14b } }
+  template:
+    metadata: { labels: { app: chat-14b } }
+    spec:
+      nodeSelector: { gpu-vendor: amd }
+      containers:
+      - name: llama-server
+        image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+        # Qwen3.6-35B-A3B (MoE, ~3B active), Unsloth UD-Q4_K_M (21.1 GiB) from the node's disk.
+        # --n-cpu-moe 14: experts of 14 layers stay in system RAM, the rest fits 16 GB VRAM.
+        # Measured 17 Oct: 14 -> 45 tok/s, 10 -> 22 tok/s (VRAM spill), MTP on -> 26 tok/s (so no MTP).
+        # Was Qwen2.5 14B Instruct Q4_K_M (-hf, alias qwen2.5-14b) until 17 Oct; Deployment name kept.
+        # Context 64k with flash attention + q4_0 KV cache (17 Oct): 44.6 tok/s, 60k-token prompt read in 155 s
+        # and retrieved correctly. q8_0 KV spilled 0.7 GB to system RAM: 23.8 tok/s, 761 s for the same prompt.
+        args: ["-m", "/models/qwen36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", "--alias", "qwen3.6-35b-a3b",
+               "-ngl", "99", "--n-cpu-moe", "14", "-c", "65536", "-np", "1",
+               "-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0",
+               "--host", "0.0.0.0", "--port", "8080", "--metrics", "--jinja"]
+        env: [{ name: LLAMA_CACHE, value: /models/llama.cpp }]
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          limits: { amd.com/gpu: 1 }
+        readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 10, failureThreshold: 120 }
+        volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+      - { name: models, hostPath: { path: /var/lib/models, type: DirectoryOrCreate } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: chat-14b, namespace: amd-demo }
+spec: { type: NodePort, selector: { app: chat-14b }, ports: [{ port: 80, targetPort: 8080, nodePort: 30084, name: http }] }

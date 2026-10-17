@@ -1,0 +1,26 @@
+# ACTIVE since 17 Oct 2026 (loaded by compose.yaml).
+# Adds a VLM preset "granite_gpu" that sends page images to Granite-Docling-258M on
+# llama.cpp (hami-demo/ocr, GTX 1080 Ti, shared via HAMi) over its OpenAI-compatible API,
+# and makes it the SERVER DEFAULT, so requests with pipeline=vlm and no preset use it.
+# paperless-gpt v0.31.0 sends pipeline=vlm without a preset, so it now uses the GPU.
+# Revert to CPU: compose.yaml.bak-cpu + DOCLING_OCR_PIPELINE=standard in paperless-gpt.env.
+
+enable_remote_services: true
+default_vlm_preset: granite_gpu
+custom_vlm_presets:
+  granite_gpu:
+    model_spec:
+      name: Granite-Docling-258M (llama.cpp on GTX 1080 Ti)
+      default_repo_id: ibm-granite/granite-docling-258M
+      prompt: Convert this page to docling.
+      response_format: doctags
+    engine_options:
+      engine_type: api
+      url: http://<ocr-endpoint>/v1/chat/completions
+      params:
+        model: granite-docling
+        max_tokens: 4096
+        temperature: 0.0   # deterministic: sampling at llama.cpp default 0.8 dropped the table
+      timeout: 120.0
+      concurrency: 1      # one page at a time: never flood the shared GPU
+    scale: 2.0

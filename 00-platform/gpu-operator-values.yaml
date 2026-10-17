@@ -1,0 +1,34 @@
+# NVIDIA GPU Operator on k3s: container toolkit + GPU Feature Discovery ONLY.
+# Tested: GPU Operator v26.3.1 on k3s v1.35.4 (Oct 2026), GTX 1080 Ti and RTX 3090 nodes.
+#
+#   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+#   helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace \
+#     -f gpu-operator-values.yaml
+#
+# Why "discovery only":
+# - The NVIDIA driver is installed on the host (driver.enabled: false).
+# - HAMi brings its OWN device plugin (it slices GPUs). Two device plugins fight over nvidia.com/gpu.
+# - Kaito needs the GFD labels (nvidia.com/gpu.product / .count / .memory) to size vLLM on your own nodes.
+#   Never install a second NFD/GFD (Kaito's chart ships one): a second NFD master wipes these labels.
+
+driver:
+  enabled: false          # driver installed on the host (>= 580 recommended for current vLLM images)
+
+toolkit:
+  enabled: true
+  env:                    # k3s keeps containerd in non-default locations
+    - name: CONTAINERD_CONFIG
+      value: /var/lib/rancher/k3s/agent/etc/containerd/config.toml
+    - name: CONTAINERD_SOCKET
+      value: /run/k3s/containerd/containerd.sock
+    - name: CONTAINERD_RUNTIME_CLASS
+      value: nvidia
+
+devicePlugin:
+  enabled: false          # HAMi provides the device plugin. (In the original lab this was switched off
+                          # in the ClusterPolicy after install; setting it here is the clean equivalent.)
+
+gfd:
+  enabled: true           # GPU Feature Discovery: Kaito reads its nvidia.com/gpu.* node labels
+nfd:
+  enabled: true           # Node Feature Discovery (GFD depends on it). Keep exactly ONE NFD in the cluster.

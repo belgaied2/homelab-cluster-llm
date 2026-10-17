@@ -1,0 +1,90 @@
+# paperless-ocr: Paperless-ngx -> paperless-gpt -> docling-serve (CPU)
+# Host: any Docker host on your LAN (not in the cluster)
+#
+#   docker compose up -d                      # starts docling-serve only
+#   docker compose --profile gpt up -d        # also starts paperless-gpt (needs the token in paperless-gpt.env)
+#   docker compose --profile gpt down         # stop everything
+#
+# paperless-gpt only acts on documents that carry AUTO_OCR_TAG (see paperless-gpt.env).
+# GPU switch (after 19 Oct 2026 only): see docling-gpu.yaml + the vault note "Paperless OCR pipeline".
+
+name: paperless-ocr
+
+services:
+  docling:
+    image: ghcr.io/docling-project/docling-serve-cpu:v1.37.0
+    container_name: paperless-ocr-docling
+    restart: unless-stopped
+    ports:
+      - "<docker-host-ip>:5001:5001"   # LAN only, no auth: docs at /docs, UI at /ui
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "true"
+      DOCLING_SERVE_MAX_SYNC_WAIT: "600"     # CPU pages can take a while
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "1" # one conversion at a time
+      DOCLING_NUM_THREADS: "2"
+      OMP_NUM_THREADS: "2"
+      UVICORN_WORKERS: "1"
+      # Remote VLM: Granite-Docling on the GTX 1080 Ti (hami-demo/ocr) is the default VLM preset (17 Oct).
+      DOCLING_SERVE_ENABLE_REMOTE_SERVICES: "true"
+      DOCLING_SERVE_CONFIG_FILE: /config/docling-config-gpu.yaml
+    volumes:
+      - ./docling-config-gpu.yaml:/config/docling-config-gpu.yaml:ro
+    # No volume on purpose: the image ships its models in /opt/app-root/src/.cache
+    # (DOCLING_SERVE_ARTIFACTS_PATH); mounting over it would hide them.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 6g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  docling-preset:
+    # Adds vlm_pipeline_preset=default to paperless-gpt's VLM requests (see preset_proxy.py),
+    # so docling-serve's default_vlm_preset (granite_gpu = GTX 1080 Ti) is used. Internal only.
+    image: python:3.12-alpine
+    container_name: paperless-ocr-docling-preset
+    restart: unless-stopped
+    command: ["python3", "-u", "/app/preset_proxy.py"]
+    environment:
+      UPSTREAM_HOST: docling
+      UPSTREAM_PORT: "5001"
+      VLM_PRESET: default
+      PORT: "5002"
+    volumes:
+      - ./preset_proxy.py:/app/preset_proxy.py:ro
+    depends_on: [docling]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
+  paperless-gpt:
+    image: icereed/paperless-gpt:v0.31.0
+    container_name: paperless-ocr-gpt
+    profiles: ["gpt"]               # NOT started by a plain `docker compose up -d`
+    restart: unless-stopped
+    env_file:
+      - ./paperless-gpt.env         # chmod 600, holds PAPERLESS_API_TOKEN
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+    ports:
+      - "<docker-host-ip>:8085:8080"   # LAN only. paperless-gpt has NO authentication
+    volumes:
+      - ./gpt/prompts:/app/prompts
+      - ./gpt/config:/app/config
+      - ./gpt/db:/app/db
+    depends_on:
+      docling:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m

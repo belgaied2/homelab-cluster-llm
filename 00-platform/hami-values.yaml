@@ -1,0 +1,28 @@
+# HAMi (CNCF) on k3s: fractional NVIDIA GPUs (memory + compute slices per pod).
+# Tested: HAMi chart 2.9.0 on k3s v1.35.4 (Oct 2026), GTX 1080 Ti (Pascal) and RTX 3090 (Ampere).
+#
+#   helm repo add hami-charts https://project-hami.github.io/HAMi/
+#   helm install hami hami-charts/hami -n hami-system --create-namespace -f hami-values.yaml
+#   kubectl label node <gpu-node> gpu=on        # HAMi's device plugin only runs on nodes with gpu=on
+#
+# Each card is advertised as 10 vGPU slots. A pod asks for a slice like this:
+#   resources:
+#     limits: { nvidia.com/gpu: 1, nvidia.com/gpumem: 5000 }   # MiB
+# Inside the pod, nvidia-smi shows only the slice, and HAMi refuses allocations beyond it (OOM at the slice).
+# Memory isolation, not performance isolation. AMD: Instinct cards only (RDNA2 consumer cards are not supported).
+#
+# Caveats seen in the lab:
+# - A pod requesting nvidia.com/gpu WITHOUT gpumem gets the whole card's memory (Kaito pods do this).
+# - Driver/library version mismatch on the host (driver upgraded, not rebooted) crash-loops the device plugin.
+# - GPU Deployments on a fully sliced card need `strategy: Recreate` (a rolling update needs a 2nd slice).
+
+devicePlugin:
+  runtimeClassName: nvidia          # RuntimeClass created by the GPU Operator toolkit
+  gpuOperatorToolkitReady:
+    enabled: true                   # wait for the toolkit before starting
+
+scheduler:
+  kubeScheduler:
+    image:
+      tag: v1.31.0                  # as deployed in the lab (worked on k3s v1.35.4). HAMi's docs suggest matching
+                                    # your Kubernetes version without the +k3s suffix; check the HAMi k3s guide.

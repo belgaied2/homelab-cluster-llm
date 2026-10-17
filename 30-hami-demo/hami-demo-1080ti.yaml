@@ -1,0 +1,143 @@
+# HAMi sharing demo: three AI workloads on ONE GTX 1080 Ti (11 GB) via HAMi memory slices.
+# Exposed as NodePorts on every node: chat 30081, embeddings 30082, whisper 30083.
+# Model files are cached on the node's disk (/var/lib/models) so restarts don't re-download.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hami-demo
+---
+# 1) Chat model: Gemma 4 E4B Instruct (Unsloth Q4_K_M, 4.7 GB, text only: --no-mmproj) on llama.cpp CUDA.
+#    Was Llama 3.2 3B Q4_K_M (5000 MiB slice) until 16 Oct. Deployment name kept so Service/NodePort/Open WebUI wiring stay.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chat-3b, namespace: hami-demo, labels: { app: chat-3b } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # rolling updates would need a 2nd GPU slice that doesn't fit
+  selector: { matchLabels: { app: chat-3b } }
+  template:
+    metadata: { labels: { app: chat-3b } }
+    spec:
+      nodeSelector: { homelab/hami-demo: "true" }
+      containers:
+      - name: llama-server
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda
+        args: ["-hf", "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M", "--no-mmproj", "--alias", "gemma-4-e4b",
+               "--host", "0.0.0.0", "--port", "8080", "-ngl", "99", "-c", "8192", "--metrics", "--jinja"]
+        env:
+        - { name: LLAMA_CACHE, value: /models/llama.cpp }
+        - { name: HF_TOKEN, valueFrom: { secretKeyRef: { name: hf-token, key: HF_TOKEN, optional: true } } }   # faster, unthrottled HF downloads
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          limits: { nvidia.com/gpu: 1, nvidia.com/gpumem: 6800 }
+        readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 10, failureThreshold: 60 }
+        volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+      - { name: models, hostPath: { path: /var/lib/models, type: DirectoryOrCreate } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: chat-3b, namespace: hami-demo }
+spec: { type: NodePort, selector: { app: chat-3b }, ports: [{ port: 80, targetPort: 8080, nodePort: 30081, name: http }] }
+---
+# 2) Embeddings: nomic-embed-text v1.5 (Q8_0, ~140 MB) on llama.cpp CUDA
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: embed, namespace: hami-demo, labels: { app: embed } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # rolling updates would need a 2nd GPU slice that doesn't fit
+  selector: { matchLabels: { app: embed } }
+  template:
+    metadata: { labels: { app: embed } }
+    spec:
+      nodeSelector: { homelab/hami-demo: "true" }
+      containers:
+      - name: llama-server
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda
+        args: ["-hf", "nomic-ai/nomic-embed-text-v1.5-GGUF:Q8_0", "--alias", "nomic-embed-text",
+               "--embedding", "--host", "0.0.0.0", "--port", "8080", "-ngl", "99", "--metrics"]
+        env: [{ name: LLAMA_CACHE, value: /models/llama.cpp }]
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          limits: { nvidia.com/gpu: 1, nvidia.com/gpumem: 1500 }
+        readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 10, failureThreshold: 60 }
+        volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+      - { name: models, hostPath: { path: /var/lib/models, type: DirectoryOrCreate } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: embed, namespace: hami-demo }
+spec: { type: NodePort, selector: { app: embed }, ports: [{ port: 80, targetPort: 8080, nodePort: 30082, name: http }] }
+---
+# 3) Speech-to-text: Speaches (faster-whisper / CTranslate2), OpenAI-compatible /v1/audio/transcriptions
+#    NOTE: the official whisper.cpp CUDA image is built for CUDA archs 75/80/86/90 only, so it crashes on
+#    the 1080 Ti (Pascal, 6.1) with "no kernel image is available". CTranslate2 still supports Pascal.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: whisper, namespace: hami-demo, labels: { app: whisper } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # rolling updates would need a 2nd GPU slice that doesn't fit
+  selector: { matchLabels: { app: whisper } }
+  template:
+    metadata: { labels: { app: whisper } }
+    spec:
+      nodeSelector: { homelab/hami-demo: "true" }
+      initContainers:   # speaches runs as non-root; the hostPath cache dir is root-owned
+      - name: cache-dir
+        image: busybox:1.36
+        command: ["sh", "-c", "mkdir -p /models/hf && chmod 0777 /models/hf"]
+        volumeMounts: [{ name: models, mountPath: /models }]
+      containers:
+      - name: speaches
+        image: ghcr.io/speaches-ai/speaches:latest-cuda
+        env:
+        - { name: HF_HOME, value: /models/hf }
+        - { name: WHISPER__COMPUTE_TYPE, value: int8 }
+        ports: [{ containerPort: 8000, name: http }]
+        resources:
+          limits: { nvidia.com/gpu: 1, nvidia.com/gpumem: 1500 }   # was 2500 until 16 Oct (uses ~1 GB active, int8)
+        readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 10, failureThreshold: 60 }
+        volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+      - { name: models, hostPath: { path: /var/lib/models, type: DirectoryOrCreate } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: whisper, namespace: hami-demo }
+spec: { type: NodePort, selector: { app: whisper }, ports: [{ port: 80, targetPort: 8000, nodePort: 30083, name: http }] }
+---
+# 4) Document OCR: IBM Granite-Docling-258M (+ f16 vision projector) on llama.cpp CUDA, added 16 Oct.
+#    Fills the free ~2.2 GB of the card. Output is DocTags (layout/table markup), hence --special.
+#    Known risk: llama.cpp issue #16601 (server chat endpoint gave malformed DocTags vs llama-mtmd-cli).
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: ocr, namespace: hami-demo, labels: { app: ocr } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # rolling updates would need a 2nd GPU slice that doesn't fit
+  selector: { matchLabels: { app: ocr } }
+  template:
+    metadata: { labels: { app: ocr } }
+    spec:
+      nodeSelector: { homelab/hami-demo: "true" }
+      containers:
+      - name: llama-server
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda
+        args: ["-hf", "ggml-org/granite-docling-258M-GGUF:Q8_0", "--alias", "granite-docling",
+               "--special", "--host", "0.0.0.0", "--port", "8080", "-ngl", "99", "-c", "8192", "--metrics"]
+        env: [{ name: LLAMA_CACHE, value: /models/llama.cpp }]
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          limits: { nvidia.com/gpu: 1, nvidia.com/gpumem: 1200 }   # was 2000 until 16 Oct (uses ~640 MiB)
+        readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 10, failureThreshold: 60 }
+        volumeMounts: [{ name: models, mountPath: /models }]
+      volumes:
+      - { name: models, hostPath: { path: /var/lib/models, type: DirectoryOrCreate } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: ocr, namespace: hami-demo }
+spec: { type: NodePort, selector: { app: ocr }, ports: [{ port: 80, targetPort: 8080, nodePort: 30085, name: http }] }

@@ -1,0 +1,105 @@
+# Slim kube-prometheus-stack for the KCD demo cluster.
+# Install (on cp1):
+#   sudo helm --kubeconfig /etc/rancher/k3s/k3s.yaml upgrade --install monitoring \
+#     prometheus-community/kube-prometheus-stack -n monitoring --create-namespace -f kube-prometheus-stack-values.yaml
+# Grafana: http://<any node IP>:30300  (anonymous viewer enabled; admin password in secret monitoring/monitoring-grafana)
+
+alertmanager:
+  enabled: false
+
+defaultRules:
+  create: false
+
+kubeEtcd: { enabled: false }
+kubeControllerManager: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeProxy: { enabled: false }
+
+prometheusOperator:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "true" }
+  admissionWebhooks:
+    patch:
+      nodeSelector: { node-role.kubernetes.io/control-plane: "true" }
+
+kube-state-metrics:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "true" }
+
+prometheus-node-exporter:
+  # drm collector = AMD GPU VRAM / busy % from amdgpu sysfs (the RX 6900 XT has no other exporter)
+  extraArgs:
+    - --collector.drm
+
+prometheus:
+  prometheusSpec:
+    nodeSelector: { node-role.kubernetes.io/control-plane: "true" }
+    retention: 3d
+    scrapeInterval: 5s          # snappy graphs on stage
+    evaluationInterval: 15s
+    resources:
+      requests: { cpu: 200m, memory: 512Mi }
+      limits: { memory: 1536Mi }
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    additionalScrapeConfigs:
+      # HAMi per-container vGPU metrics (vgpu-monitor sidecar of the device plugin, :9394)
+      - job_name: hami-device-plugin
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [hami-system] } }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component], regex: hami-device-plugin, action: keep }
+          - { source_labels: [__meta_kubernetes_pod_ip], target_label: __address__, replacement: "$1:9394" }
+          - { source_labels: [__meta_kubernetes_pod_node_name], target_label: node }
+        metric_relabel_configs:
+          # HAMi's own pod/namespace labels describe the GPU workload; keep them
+          - { regex: exported_(pod|namespace), action: labeldrop }
+      # HAMi scheduler: allocated vs physical memory per GPU
+      - job_name: hami-scheduler
+        static_configs: [{ targets: ["hami-scheduler.hami-system.svc:31993"] }]
+      # NVIDIA DCGM exporter (GPU util, power, temperature, framebuffer)
+      - job_name: dcgm-exporter
+        kubernetes_sd_configs: [{ role: endpoints, namespaces: { names: [gpu-operator] } }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_service_name], regex: nvidia-dcgm-exporter, action: keep }
+          - { source_labels: [__meta_kubernetes_pod_node_name], target_label: node }
+      # llama.cpp servers (--metrics on :8080) in hami-demo and amd-demo
+      - job_name: llama-cpp
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [hami-demo, amd-demo] } }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_container_name], regex: llama-server, action: keep }
+          - { source_labels: [__meta_kubernetes_pod_ip], target_label: __address__, replacement: "$1:8080" }
+          - { source_labels: [__meta_kubernetes_namespace], target_label: namespace }
+          - { source_labels: [__meta_kubernetes_pod_label_app], target_label: app }
+          - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+          - { source_labels: [__meta_kubernetes_pod_node_name], target_label: node }
+      # vLLM pods created by Kaito (llm namespace) - untested until an NVIDIA >= CC 7.0 node exists
+      - job_name: vllm
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [llm] } }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_label_kaito_sh_workspace], regex: .+, action: keep }
+          - { source_labels: [__meta_kubernetes_pod_ip], target_label: __address__, replacement: "$1:5000" }
+          - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+          - { source_labels: [__meta_kubernetes_pod_node_name], target_label: node }
+      # llm-d router / EPP metrics - untested
+      - job_name: llm-d-epp
+        kubernetes_sd_configs: [{ role: pod, namespaces: { names: [llm] } }]
+        relabel_configs:
+          - { source_labels: [__meta_kubernetes_pod_name], regex: ".*-epp-.*", action: keep }
+          - { source_labels: [__meta_kubernetes_pod_ip], target_label: __address__, replacement: "$1:9090" }
+          - { source_labels: [__meta_kubernetes_pod_name], target_label: pod }
+
+grafana:
+  nodeSelector: { node-role.kubernetes.io/control-plane: "true" }
+  service:
+    type: NodePort
+    nodePort: 30300
+  grafana.ini:
+    auth.anonymous:
+      enabled: true
+      org_role: Viewer
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/homelab-inference.json
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: monitoring
+  defaultDashboardsEnabled: false

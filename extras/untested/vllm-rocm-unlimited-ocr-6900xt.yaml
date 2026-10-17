@@ -1,0 +1,71 @@
+# EXPERIMENT (16 Oct): baidu/Unlimited-OCR on vLLM ROCm, RX 6900 XT (RDNA2, gfx1030).
+# The gfx1030 architecture is NOT in vLLM's supported ROCm list (gfx90a/942/950/1100/1101/1150/1151/1200/1201),
+# so we spoof RDNA3 with HSA_OVERRIDE_GFX_VERSION=11.0.0. Expected risk: wrong-ISA kernels crash.
+# Translation of the docker run recipe:
+#   --device /dev/kfd /dev/dri  -> amd.com/gpu: 1 (ROCm device plugin) + privileged
+#   --group-add video           -> supplementalGroups 44 (video) + 991 (render, owns /dev/kfd and renderD128 on this node)
+#   --ipc=host                  -> /dev/shm as a memory emptyDir
+#   ~/.cache/huggingface        -> hostPath /var/lib/models/huggingface
+# The card is whole-GPU only: chat-14b (amd-demo) must be scaled to 0 while this runs.
+apiVersion: v1
+kind: Namespace
+metadata: { name: ocr-test }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: unlimited-ocr, namespace: ocr-test, labels: { app: unlimited-ocr } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: unlimited-ocr } }
+  template:
+    metadata: { labels: { app: unlimited-ocr } }
+    spec:
+      nodeSelector: { gpu-vendor: amd }
+      securityContext:
+        supplementalGroups: [44, 991]
+        seccompProfile: { type: Unconfined }
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai-rocm:latest
+        args:
+        - baidu/Unlimited-OCR
+        - --trust-remote-code
+        - --logits_processors
+        - vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
+        - --no-enable-prefix-caching
+        - --mm-processor-cache-gb
+        - "0"
+        - --tensor-parallel-size
+        - "1"
+        - --served-model-name
+        - unlimited-ocr
+        - --max-model-len
+        - "16384"
+        - --gpu-memory-utilization
+        - "0.85"
+        - --enforce-eager
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        env:
+        - { name: HSA_OVERRIDE_GFX_VERSION, value: "11.0.0" }   # gfx1030 -> pretend gfx1100 (RDNA3)
+        - { name: VLLM_ROCM_USE_AITER, value: "0" }             # AITER kernels are MI300-class only
+        - { name: HF_HOME, value: /root/.cache/huggingface }
+        ports: [{ containerPort: 8000, name: http }]
+        securityContext: { privileged: true }
+        resources:
+          limits: { amd.com/gpu: 1 }
+        readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 10, failureThreshold: 180 }
+        volumeMounts:
+        - { name: hf-cache, mountPath: /root/.cache/huggingface }
+        - { name: dshm, mountPath: /dev/shm }
+      volumes:
+      - { name: hf-cache, hostPath: { path: /var/lib/models/huggingface, type: DirectoryOrCreate } }
+      - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: unlimited-ocr, namespace: ocr-test }
+spec: { type: NodePort, selector: { app: unlimited-ocr }, ports: [{ port: 80, targetPort: 8000, nodePort: 30085, name: http }] }

@@ -1,0 +1,57 @@
+# Kaito InferenceSet -> vLLM replica(s) + (via Flux) InferencePool + llm-d router (EPP),
+# plus the Istio DestinationRule and HTTPRoute that connect it to ../10-gateway/inference-gateway.yaml.
+# Tested: Kaito 0.12.0 (llm-d-router-gateway chart v0.9.0), Istio 1.28.3, RTX 3090, Oct 2026.
+#
+# Notes:
+# - llm-d routing only comes with an InferenceSet. A plain Workspace gets no InferencePool.
+# - The served model name becomes the InferenceSet name: request model "phi-4-mini", not "phi-4-mini-instruct".
+# - GPU nodes must carry the label in labelSelector and NVIDIA GFD labels (gpu.product/count/memory).
+# - replicas: 1 shows the wiring, not the benefit: the router needs 2+ replicas to choose between.
+#   2 replicas on ONE GPU via HAMi slicing is untested (Kaito requests whole GPUs, no gpumem field).
+apiVersion: kaito.sh/v1beta1
+kind: InferenceSet
+metadata:
+  name: phi-4-mini
+  namespace: llm
+spec:
+  replicas: 1
+  labelSelector:
+    matchLabels:
+      apps: llm-inference
+  template:
+    inference:
+      preset:
+        accessMode: public
+        name: phi-4-mini-instruct
+---
+# The EPP (llm-d-router-endpoint-picker v0.9.0) listens on plaintext gRPC.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: phi-4-mini-inferencepool-epp
+  namespace: llm
+spec:
+  host: phi-4-mini-inferencepool-epp
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-route
+  namespace: llm
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: inference-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: inference.networking.k8s.io
+          kind: InferencePool
+          name: phi-4-mini-inferencepool
